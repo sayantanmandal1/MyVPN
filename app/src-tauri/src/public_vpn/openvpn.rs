@@ -16,20 +16,27 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Locate the OpenVPN executable: prefer the copy bundled with the app, then
-/// fall back to a system-wide install.
+/// Locate the OpenVPN executable. Prefers the copy bundled inside the installed
+/// app (no separate OpenVPN install is required); falls back to a system-wide
+/// install if, for some reason, the bundle is missing.
 pub fn find_openvpn(resource_dir: &Path) -> Option<PathBuf> {
-    let bundled = resource_dir.join("openvpn").join("openvpn.exe");
-    if bundled.exists() {
-        return Some(bundled);
+    let mut candidates = vec![
+        resource_dir.join("openvpn").join("openvpn.exe"),
+        resource_dir.join("openvpn.exe"),
+    ];
+    // Some packaging layouts place resources next to the executable rather than
+    // under the reported resource dir; check those too.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("openvpn").join("openvpn.exe"));
+            candidates.push(dir.join("resources").join("openvpn").join("openvpn.exe"));
+        }
     }
-    [
-        r"C:\Program Files\OpenVPN\bin\openvpn.exe",
-        r"C:\Program Files (x86)\OpenVPN\bin\openvpn.exe",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .find(|p| p.exists())
+    // Last resort: a system-wide OpenVPN install.
+    candidates.push(PathBuf::from(r"C:\Program Files\OpenVPN\bin\openvpn.exe"));
+    candidates.push(PathBuf::from(r"C:\Program Files (x86)\OpenVPN\bin\openvpn.exe"));
+
+    candidates.into_iter().find(|p| p.exists())
 }
 
 /// Reserve a free localhost TCP port for the management interface. The listener

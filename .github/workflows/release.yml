@@ -83,5 +83,15 @@ jobs:
             > rights to create the secure network tunnel.
           releaseDraft: false
           prerelease: false
-          # Stable asset name so the README "latest" download link never breaks.
-          releaseAssetNamePattern: "MyVPN-Setup-[arch].[ext]"
+
+      - name: Attach stable-named installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $exe = Get-ChildItem app/src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          if (-not $exe) { throw "No NSIS installer found to attach." }
+          $stable = Join-Path $exe.Directory.FullName "MyVPN-Setup-x64.exe"
+          Copy-Item $exe.FullName $stable -Force
+          Write-Host "Uploading $($stable) to release ${{ github.ref_name }}"
+          gh release upload ${{ github.ref_name }} "$stable" --clobber --repo ${{ github.repository }}

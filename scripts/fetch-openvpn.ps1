@@ -24,30 +24,35 @@ $wintun = Join-Path $repoRoot "app/src-tauri/wintun.dll"
 
 New-Item -ItemType Directory -Force -Path $destDir | Out-Null
 
-$openvpnBin = "C:\Program Files\OpenVPN\bin"
-$openvpnExe = Join-Path $openvpnBin "openvpn.exe"
+function Find-OpenVpnBin {
+  foreach ($base in @("$env:ProgramFiles\OpenVPN\bin", "${env:ProgramFiles(x86)}\OpenVPN\bin")) {
+    if ($base -and (Test-Path (Join-Path $base "openvpn.exe"))) { return $base }
+  }
+  return $null
+}
 
-if (-not (Test-Path $openvpnExe)) {
+$bin = Find-OpenVpnBin
+if (-not $bin) {
   if (Get-Command choco -ErrorAction SilentlyContinue) {
     Write-Host "Installing OpenVPN via Chocolatey ..."
-    choco install openvpn --no-progress -y | Out-Host
-  } else {
-    throw @"
-OpenVPN client not found at $openvpnExe and Chocolatey is unavailable.
-Install OpenVPN (https://openvpn.net/community-downloads/) and re-run, or run
-this on CI where Chocolatey is present.
-"@
+    # choco may exit non-zero if the (unneeded) TAP driver step is finicky; we
+    # only need the client files, so success is verified by file presence below.
+    & choco install openvpn --no-progress -y 2>&1 | Out-Host
+    $bin = Find-OpenVpnBin
   }
 }
-
-if (-not (Test-Path $openvpnExe)) {
-  throw "OpenVPN install did not produce $openvpnExe"
+if (-not $bin) {
+  throw @"
+OpenVPN client could not be found or installed.
+On CI, ensure Chocolatey is available (it is on windows-latest runners).
+Locally, install OpenVPN from https://openvpn.net/community-downloads/ and re-run.
+"@
 }
 
-Write-Host "Staging OpenVPN client from $openvpnBin ..."
-# Copy the client binaries (openvpn.exe + its runtime DLLs). The driver service
-# component is intentionally not bundled; we use the userspace Wintun adapter.
-Copy-Item (Join-Path $openvpnBin "*") -Destination $destDir -Recurse -Force
+Write-Host "Staging OpenVPN client from $bin ..."
+# Copy the client binaries (openvpn.exe + its runtime DLLs). The driver/service
+# components are intentionally not bundled; we use the userspace Wintun adapter.
+Copy-Item (Join-Path $bin "*") -Destination $destDir -Recurse -Force
 
 # Ensure a Wintun DLL is present for OpenVPN's data plane.
 if (Test-Path $wintun) {
@@ -58,4 +63,6 @@ if (Test-Path $wintun) {
 
 $staged = Join-Path $destDir "openvpn.exe"
 if (-not (Test-Path $staged)) { throw "Failed to stage openvpn.exe at $staged" }
-Write-Host "Staged OpenVPN client at $destDir"
+
+$count = (Get-ChildItem $destDir -File).Count
+Write-Host "Staged $count OpenVPN client files at $destDir"
