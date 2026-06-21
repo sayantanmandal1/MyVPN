@@ -1,0 +1,7 @@
+This folder is populated at build time by scripts/fetch-openvpn.ps1, which stages
+the OpenVPN client (openvpn.exe + its DLLs + wintun.dll) here so the installer can
+bundle a turnkey client for the Public VPN mode.
+
+This placeholder only exists so the Tauri resource glob ("openvpn/*") always
+matches at least one file for local/dev builds that haven't run the fetch script.
+The real binaries are git-ignored.

@@ -1,0 +1,87 @@
+name: Release
+
+# Triggered by: git tag v0.0.1 && git push --tags
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Windows installer
+    runs-on: windows-latest
+
+    env:
+      # Optional Authenticode signing. Set these repository secrets to produce a
+      # signed installer; without them the build still succeeds (unsigned).
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./app/src-tauri -> target"
+
+      - name: Install frontend dependencies
+        working-directory: ./app
+        run: npm install
+
+      - name: Fetch Wintun driver
+        shell: pwsh
+        run: ./scripts/fetch-wintun.ps1
+
+      - name: Stage bundled OpenVPN client
+        shell: pwsh
+        run: ./scripts/fetch-openvpn.ps1
+
+      - name: Import code-signing certificate
+        if: env.WINDOWS_CERTIFICATE != ''
+        shell: pwsh
+        run: |
+          $bytes = [System.Convert]::FromBase64String($env:WINDOWS_CERTIFICATE)
+          $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [System.IO.File]::WriteAllBytes($pfx, $bytes)
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          # Inject the thumbprint so the Tauri bundler signs the installer.
+          $conf = 'app/src-tauri/tauri.conf.json'
+          $json = Get-Content $conf -Raw | ConvertFrom-Json
+          $json.bundle.windows | Add-Member -NotePropertyName certificateThumbprint -NotePropertyValue $cert.Thumbprint -Force
+          $json | ConvertTo-Json -Depth 32 | Set-Content $conf
+          Remove-Item $pfx -Force
+
+      - name: Build app & publish release
+        id: tauri
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: app
+          tagName: ${{ github.ref_name }}
+          releaseName: "MyVPN ${{ github.ref_name }}"
+          releaseBody: |
+            ## MyVPN ${{ github.ref_name }}
+
+            Serverless peer-to-peer VPN. Download the Windows installer below.
+
+            > Run the installer, then launch **MyVPN**. The app needs Administrator
+            > rights to create the secure network tunnel.
+          releaseDraft: false
+          prerelease: false
+          # Stable asset name so the README "latest" download link never breaks.
+          releaseAssetNamePattern: "MyVPN-Setup-[arch].[ext]"

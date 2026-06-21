@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+dist-ssr/
+build/
+out/
+.next/
+.turbo/
+
+# Rust / Tauri
+target/
+**/target/
+app/src-tauri/gen/
+Cargo.lock.bak
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# Local runtime data
+*.local
+
+# Wintun driver binary (downloaded at build time)
+app/src-tauri/wintun.dll
+
+# Bundled OpenVPN client (staged at build time by scripts/fetch-openvpn.ps1).
+# Keep the folder + placeholder, ignore the fetched binaries.
+app/src-tauri/openvpn/*
+!app/src-tauri/openvpn/placeholder.txt
