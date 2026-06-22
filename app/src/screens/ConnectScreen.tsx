@@ -48,6 +48,9 @@ export function ConnectScreen({
   const [name, setName] = useState("");
   const [passphrase, setPassphrase] = useState("");
   const [code, setCode] = useState("");
+  const [codePass, setCodePass] = useState("");
+  const [openHost, setOpenHost] = useState<string | null>(null);
+  const [hostPass, setHostPass] = useState("");
 
   const clientActive =
     status.role === "client" &&
@@ -141,16 +144,30 @@ export function ConnectScreen({
             <ul className="space-y-1">
               {discovered.map((h) => {
                 const { Icon, label } = sourceMeta(h.source);
+                const open = openHost === h.endpointId;
+                const connectHost = () => {
+                  onConnect({
+                    networkName: h.networkName,
+                    endpointId: h.endpointId,
+                    passphrase: hostPass.trim() || null,
+                  });
+                  setOpenHost(null);
+                };
                 return (
                   <li key={h.endpointId}>
                     <button
                       disabled={busy}
-                      onClick={() =>
-                        onConnect({
-                          networkName: h.networkName,
-                          endpointId: h.endpointId,
-                        })
-                      }
+                      onClick={() => {
+                        if (h.requiresPassphrase) {
+                          setHostPass("");
+                          setOpenHost(open ? null : h.endpointId);
+                        } else {
+                          onConnect({
+                            networkName: h.networkName,
+                            endpointId: h.endpointId,
+                          });
+                        }
+                      }}
                       className="group flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left transition hover:bg-white/5 disabled:opacity-50"
                     >
                       <span className="grid h-9 w-9 place-items-center rounded-lg bg-white/5">
@@ -167,8 +184,37 @@ export function ConnectScreen({
                           )}
                         </span>
                       </span>
-                      <ChevronRight className="h-4 w-4 text-[color:var(--color-faint)] transition group-hover:translate-x-0.5 group-hover:text-ink" />
+                      <ChevronRight
+                        className={cn(
+                          "h-4 w-4 text-[color:var(--color-faint)] transition group-hover:translate-x-0.5 group-hover:text-ink",
+                          open && "rotate-90",
+                        )}
+                      />
                     </button>
+                    {open && (
+                      <div className="flex items-center gap-2 px-3 pb-2.5 pt-0.5">
+                        <div className="flex-1">
+                          <TextField
+                            type="password"
+                            placeholder="Passphrase"
+                            value={hostPass}
+                            autoFocus
+                            onChange={(e) => setHostPass(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" && !busy) connectHost();
+                            }}
+                          />
+                        </div>
+                        <Button
+                          variant="primary"
+                          size="sm"
+                          disabled={busy}
+                          onClick={connectHost}
+                        >
+                          Connect
+                        </Button>
+                      </div>
+                    )}
                   </li>
                 );
               })}
@@ -220,6 +266,12 @@ export function ConnectScreen({
                 value={code}
                 onChange={(e) => setCode(e.target.value)}
               />
+              <TextField
+                type="password"
+                placeholder="Passphrase (if the network has one)"
+                value={codePass}
+                onChange={(e) => setCodePass(e.target.value)}
+              />
               <Button
                 variant="subtle"
                 className="w-full"
@@ -228,6 +280,7 @@ export function ConnectScreen({
                   onConnect({
                     networkName: "Paired network",
                     ticket: code.trim(),
+                    passphrase: codePass.trim() || null,
                   })
                 }
               >

@@ -20,10 +20,12 @@ pub struct FetchedServer {
     pub ovpn: String,
 }
 
-/// Fetch and merge servers from every configured source. Best-effort: a source
-/// that fails is logged and skipped so the others still populate the list.
-pub async fn fetch_all() -> Vec<FetchedServer> {
+/// Fetch and merge servers from every configured source. Returns a descriptive
+/// error when nothing could be loaded, so the UI can explain *why* the list is
+/// empty instead of silently showing nothing.
+pub async fn fetch_all() -> anyhow::Result<Vec<FetchedServer>> {
     let mut out = Vec::new();
+    let mut errors = Vec::new();
 
     // Sources are independent; add more here as they are implemented.
     match fetch_vpngate().await {
@@ -31,35 +33,68 @@ pub async fn fetch_all() -> Vec<FetchedServer> {
             tracing::info!("vpngate: {} servers", v.len());
             out.append(&mut v);
         }
-        Err(e) => tracing::warn!("vpngate source failed: {e}"),
+        Err(e) => {
+            tracing::warn!("vpngate source failed: {e}");
+            errors.push(format!("VPN Gate: {e}"));
+        }
     }
 
-    out
+    if out.is_empty() {
+        anyhow::bail!(
+            "Could not load public servers. {}",
+            if errors.is_empty() {
+                "Please try again shortly.".to_string()
+            } else {
+                errors.join("; ")
+            }
+        );
+    }
+    Ok(out)
 }
 
-const VPNGATE_API: &str = "https://www.vpngate.net/api/iphone/";
+/// Server-list sources, tried in order. Our own GitHub-hosted mirror comes
+/// first: VPN Gate's website blocks automated clients (a WAF returns 403 on
+/// most networks), but GitHub raw content is never blocked and is refreshed
+/// hourly by `.github/workflows/servers.yml`. The direct VPN Gate API is kept
+/// as a fallback for the rare networks where it is reachable.
+const VPNGATE_SOURCES: &[&str] = &[
+    "https://raw.githubusercontent.com/sayantanmandal1/MyVPN/vpn-data/servers.csv",
+    "https://www.vpngate.net/api/iphone/",
+    "http://www.vpngate.net/api/iphone/",
+];
 
 fn http_client() -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
-        .user_agent(concat!(
-            "MyVPN/",
-            env!("CARGO_PKG_VERSION"),
-            " (+https://github.com/sayantanmandal1/MyVPN)"
-        ))
-        .timeout(Duration::from_secs(30))
+        // A browser-like UA avoids naive WAF/bot blocks; the network can still
+        // block VPN Gate entirely (many ISPs/firewalls do), which surfaces as a
+        // clear error in the UI.
+        .user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) MyVPN/1.0",
+        )
+        .timeout(Duration::from_secs(45))
         .build()
 }
 
 async fn fetch_vpngate() -> anyhow::Result<Vec<FetchedServer>> {
     let client = http_client()?;
-    let body = client
-        .get(VPNGATE_API)
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    Ok(parse_vpngate(&body))
+    let mut last_err: Option<anyhow::Error> = None;
+    for url in VPNGATE_SOURCES {
+        match client.get(*url).send().await.and_then(|r| r.error_for_status()) {
+            Ok(resp) => match resp.text().await {
+                Ok(body) => {
+                    let servers = parse_vpngate(&body);
+                    if !servers.is_empty() {
+                        return Ok(servers);
+                    }
+                    last_err = Some(anyhow::anyhow!("server list was empty"));
+                }
+                Err(e) => last_err = Some(e.into()),
+            },
+            Err(e) => last_err = Some(e.into()),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no reachable endpoint")))
 }
 
 /// Parse the VPN Gate CSV API response into servers.

@@ -15,14 +15,14 @@ export function Toggle({ checked, onChange, disabled }: Props) {
       disabled={disabled}
       onClick={() => onChange(!checked)}
       className={cn(
-        "relative h-6 w-11 shrink-0 rounded-full transition-colors duration-200 disabled:opacity-40",
+        "relative inline-flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition-colors duration-200 disabled:opacity-40",
         checked ? "bg-accent" : "bg-white/15",
       )}
     >
       <span
         className={cn(
-          "absolute top-0.5 h-5 w-5 rounded-full bg-white shadow-md transition-transform duration-200",
-          checked ? "translate-x-[22px]" : "translate-x-0.5",
+          "inline-block h-5 w-5 rounded-full bg-white shadow-md transition-transform duration-200",
+          checked ? "translate-x-5" : "translate-x-0",
         )}
       />
     </button>

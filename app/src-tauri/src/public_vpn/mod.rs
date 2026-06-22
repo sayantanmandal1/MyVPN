@@ -30,29 +30,16 @@ fn to_err<E: std::fmt::Display>(e: E) -> VpnError {
     VpnError::msg(e.to_string())
 }
 
+#[derive(Default)]
 struct Inner {
     servers: Vec<PublicServer>,
     /// Decoded OpenVPN config per server id (kept server-side only).
     configs: HashMap<String, String>,
     status: PublicStatus,
-    child: Option<std::process::Child>,
+    child: Option<openvpn::ProcHandle>,
     mgmt_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     monitor: Option<Task>,
     connected_at: Option<Instant>,
-}
-
-impl Default for Inner {
-    fn default() -> Self {
-        Self {
-            servers: Vec::new(),
-            configs: HashMap::new(),
-            status: PublicStatus::default(),
-            child: None,
-            mgmt_tx: None,
-            monitor: None,
-            connected_at: None,
-        }
-    }
 }
 
 /// The public VPN manager, shared via Tauri managed state.
@@ -80,12 +67,7 @@ impl PublicVpn {
 
     /// Refresh the cached server list from all sources. Returns the count.
     pub async fn refresh(&self) -> Result<usize> {
-        let fetched = sources::fetch_all().await;
-        if fetched.is_empty() {
-            return Err(VpnError::msg(
-                "Could not load any public servers (check your internet connection).",
-            ));
-        }
+        let fetched = sources::fetch_all().await.map_err(to_err)?;
 
         let mut servers = Vec::with_capacity(fetched.len());
         let mut configs = HashMap::new();
@@ -158,30 +140,67 @@ impl PublicVpn {
         let cfg_path = self.data_dir.join("public.ovpn");
         std::fs::write(&cfg_path, ovpn).map_err(to_err)?;
 
-        let proc = openvpn::spawn(&exe, &cfg_path, &self.data_dir).map_err(to_err)?;
-        let mgmt_port = proc.mgmt_port;
-
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // Reflect intent right away. The app already runs elevated (manifest),
+        // so OpenVPN starts without a prompt; show progress while it launches.
         {
             let mut g = self.inner.lock();
-            g.child = Some(proc.child);
             g.connected_at = None;
-            g.mgmt_tx = Some(tx);
             g.status = PublicStatus {
                 state: PublicState::Connecting,
                 server_id: Some(server.id.clone()),
                 country: Some(server.country.clone()),
                 country_code: Some(server.country_code.clone()),
-                message: Some(format!(
-                    "Connecting to {} · {}",
-                    server.country, server.hostname
-                )),
+                message: Some("Connecting…".to_string()),
                 connected_secs: 0,
             };
         }
         emit(&self.app, &self.inner);
 
-        let monitor = spawn_monitor(mgmt_port, rx, self.app.clone(), self.inner.clone());
+        // Launching can briefly block (only if a UAC fallback is needed), so run
+        // it off the async runtime to avoid stalling other tasks.
+        let exe2 = exe.clone();
+        let cfg2 = cfg_path.clone();
+        let dir2 = self.data_dir.clone();
+        let proc = match tokio::task::spawn_blocking(move || openvpn::spawn(&exe2, &cfg2, &dir2))
+            .await
+        {
+            Ok(Ok(proc)) => proc,
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                set_state(&self.app, &self.inner, PublicState::Error, Some(&msg));
+                return Err(to_err(msg));
+            }
+            Err(e) => {
+                set_state(
+                    &self.app,
+                    &self.inner,
+                    PublicState::Error,
+                    Some("Failed to launch OpenVPN."),
+                );
+                return Err(to_err(e));
+            }
+        };
+        let mgmt_port = proc.mgmt_port;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        {
+            let mut g = self.inner.lock();
+            g.child = Some(proc.proc);
+            g.mgmt_tx = Some(tx);
+            g.status.message = Some(format!(
+                "Connecting to {} · {}",
+                server.country, server.hostname
+            ));
+        }
+        emit(&self.app, &self.inner);
+
+        let monitor = spawn_monitor(
+            mgmt_port,
+            rx,
+            self.app.clone(),
+            self.inner.clone(),
+            self.data_dir.clone(),
+        );
         self.inner.lock().monitor = Some(monitor);
 
         Ok(self.status())
@@ -199,20 +218,18 @@ impl PublicVpn {
         };
         emit(&self.app, &self.inner);
 
-        // Ask OpenVPN to tear down its own routes/DNS and exit.
+        // Ask OpenVPN to tear down its own routes/DNS and exit cleanly. This is
+        // a management-socket command interpreted by OpenVPN itself, so it works
+        // even though the process runs elevated.
         if let Some(tx) = tx {
             let _ = tx.send("signal SIGTERM\n".to_string());
         }
-        if child.is_some() {
-            tokio::time::sleep(Duration::from_millis(800)).await;
-        }
-        if let Some(mut child) = child {
-            match child.try_wait() {
-                Ok(Some(_)) => {}
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
+        if let Some(mut handle) = child {
+            if !handle.has_exited() {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+            }
+            if !handle.has_exited() {
+                handle.kill();
             }
         }
         if let Some(m) = monitor {
@@ -240,21 +257,27 @@ fn spawn_monitor(
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
     app: AppHandle,
     inner: Arc<Mutex<Inner>>,
+    data_dir: PathBuf,
 ) -> Task {
     tauri::async_runtime::spawn(async move {
-        // OpenVPN needs a moment to bind the port; retry briefly.
+        // OpenVPN needs a moment to bind the port; retry for a while to also
+        // tolerate the user pausing on the elevation prompt.
         let mut stream = None;
-        for _ in 0..40 {
+        for _ in 0..60 {
             match TcpStream::connect(("127.0.0.1", port)).await {
                 Ok(s) => {
                     stream = Some(s);
                     break;
                 }
-                Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+                Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
             }
         }
         let Some(stream) = stream else {
-            set_state(&app, &inner, PublicState::Error, Some("Could not attach to OpenVPN."));
+            let msg = match openvpn::log_reason(&data_dir) {
+                Some(r) => format!("Couldn't start OpenVPN — {r}"),
+                None => "Couldn't attach to OpenVPN.".to_string(),
+            };
+            set_state(&app, &inner, PublicState::Error, Some(&msg));
             return;
         };
 
@@ -267,7 +290,15 @@ fn spawn_monitor(
             tokio::select! {
                 line = lines.next_line() => {
                     match line {
-                        Ok(Some(l)) => handle_mgmt_line(&l, &app, &inner),
+                        Ok(Some(l)) => {
+                            // Some free configs declare `auth-user-pass`; answer
+                            // the management password query so they still connect
+                            // instead of stalling.
+                            if let Some(reply) = mgmt_password_reply(&l) {
+                                let _ = write_half.write_all(reply.as_bytes()).await;
+                            }
+                            handle_mgmt_line(&l, &app, &inner);
+                        }
                         _ => break, // EOF: OpenVPN exited
                     }
                 }
@@ -280,15 +311,42 @@ fn spawn_monitor(
             }
         }
 
-        // The socket closed: if we were still up, this was an unexpected drop.
-        let unexpected = {
-            let g = inner.lock();
-            matches!(g.status.state, PublicState::Connecting | PublicState::Connected)
-        };
-        if unexpected {
-            set_state(&app, &inner, PublicState::Error, Some("Connection lost."));
+        // The management socket closed. What we surface depends on where we
+        // were: a user-initiated disconnect already set Idle (stay silent); a
+        // drop while Connecting means we never tunneled; a drop while Connected
+        // means the link was lost. OpenVPN's own log explains why.
+        let state_now = inner.lock().status.state;
+        match state_now {
+            PublicState::Connecting => {
+                let msg = match openvpn::log_reason(&data_dir) {
+                    Some(r) => format!("Couldn't establish the connection — {r}"),
+                    None => "Couldn't establish the connection. The server may be \
+                             offline, or administrator approval was declined."
+                        .to_string(),
+                };
+                set_state(&app, &inner, PublicState::Error, Some(&msg));
+            }
+            PublicState::Connected => {
+                let msg = match openvpn::log_reason(&data_dir) {
+                    Some(r) => format!("Connection lost — {r}"),
+                    None => "Connection lost.".to_string(),
+                };
+                set_state(&app, &inner, PublicState::Error, Some(&msg));
+            }
+            _ => {}
         }
     })
+}
+
+/// Reply to OpenVPN's management password query. Free servers (e.g. VPN Gate)
+/// that declare `auth-user-pass` accept throwaway credentials, so supplying them
+/// lets those configs connect instead of stalling on the prompt.
+fn mgmt_password_reply(line: &str) -> Option<String> {
+    if line.starts_with(">PASSWORD:Need 'Auth'") {
+        Some("username \"Auth\" \"vpn\"\npassword \"Auth\" \"vpn\"\n".to_string())
+    } else {
+        None
+    }
 }
 
 fn handle_mgmt_line(line: &str, app: &AppHandle, inner: &Arc<Mutex<Inner>>) {
@@ -317,10 +375,6 @@ fn handle_mgmt_line(line: &str, app: &AppHandle, inner: &Arc<Mutex<Inner>>) {
             "RECONNECTING" => {
                 g.status.state = PublicState::Connecting;
                 g.status.message = Some("Reconnecting…".to_string());
-            }
-            "EXITING" => {
-                g.status.state = PublicState::Error;
-                g.status.message = Some("Disconnected.".to_string());
             }
             "WAIT" | "AUTH" | "GET_CONFIG" | "ASSIGN_IP" | "ADD_ROUTES" | "TCP_CONNECT"
             | "RESOLVE" => {

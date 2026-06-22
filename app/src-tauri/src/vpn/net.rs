@@ -9,6 +9,12 @@ use std::net::IpAddr;
 use std::process::Command;
 use std::str::FromStr;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 use crate::error::{Result, VpnError};
 
 /// Reject anything that isn't a bare IP literal before it reaches a shell
@@ -21,8 +27,11 @@ fn ensure_ip(value: &str) -> Result<()> {
 }
 
 fn run(program: &str, args: &[&str]) -> Result<()> {
-    let output = Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let output = cmd
         .output()
         .map_err(|e| VpnError::msg(format!("failed to launch {program}: {e}")))?;
     if !output.status.success() {
@@ -45,8 +54,11 @@ fn pwsh(script: &str) -> Result<()> {
 }
 
 fn pwsh_out(script: &str) -> Result<String> {
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+    let mut cmd = Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let output = cmd
         .output()
         .map_err(|e| VpnError::msg(format!("failed to launch powershell: {e}")))?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -55,12 +67,10 @@ fn pwsh_out(script: &str) -> Result<String> {
 /// Assign a static IPv4 address to the tunnel interface.
 pub fn set_interface_ipv4(alias: &str, ip: &str, prefix: u8) -> Result<()> {
     ensure_ip(ip)?;
-    // Clear any stale address first, then assign.
-    let _ = pwsh(&format!(
-        "Remove-NetIPAddress -InterfaceAlias '{alias}' -Confirm:$false -ErrorAction SilentlyContinue"
-    ));
+    // Clear any stale address first, then assign (one shell round-trip).
     pwsh(&format!(
-        "New-NetIPAddress -InterfaceAlias '{alias}' -IPAddress {ip} -PrefixLength {prefix} -ErrorAction Stop | Out-Null"
+        "Remove-NetIPAddress -InterfaceAlias '{alias}' -Confirm:$false -ErrorAction SilentlyContinue; \
+         New-NetIPAddress -InterfaceAlias '{alias}' -IPAddress {ip} -PrefixLength {prefix} -ErrorAction Stop | Out-Null"
     ))
 }
 
@@ -80,18 +90,55 @@ pub fn set_mtu(alias: &str, mtu: u32) -> Result<()> {
     )
 }
 
-/// Point the tunnel interface's DNS at the given resolver (prevents DNS leaks).
-pub fn set_dns(alias: &str, server: &str) -> Result<()> {
-    ensure_ip(server)?;
-    pwsh(&format!(
-        "Set-DnsClientServerAddress -InterfaceAlias '{alias}' -ServerAddresses {server}"
-    ))
-}
-
 /// Restore automatic (DHCP) DNS on the tunnel interface.
 pub fn reset_dns(alias: &str) {
     let _ = pwsh(&format!(
         "Set-DnsClientServerAddress -InterfaceAlias '{alias}' -ResetServerAddresses -ErrorAction SilentlyContinue"
+    ));
+}
+
+// The Windows policy that disables "smart multi-homed name resolution" (parallel
+// DNS queries across every interface), which would otherwise leak lookups to the
+// local network's resolver even while the tunnel is up.
+const DNS_POLICY_KEY: &str = r"HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient";
+const DNS_POLICY_VAL: &str = "DisableSmartNameResolution";
+
+/// Harden client DNS against leaks while the full tunnel is up, in one shot:
+/// point the tunnel interface at the tunnel resolver, make it the preferred
+/// interface, and disable Windows' parallel multi-homed name resolution so no
+/// lookup escapes to the local network. Returns the prior policy value (None if
+/// it was unset) so teardown can restore it exactly.
+pub fn harden_client_dns(alias: &str, dns: &str) -> Option<u32> {
+    if ensure_ip(dns).is_err() {
+        return None;
+    }
+    let prior = pwsh_out(&format!(
+        "(Get-ItemProperty -Path '{DNS_POLICY_KEY}' -Name '{DNS_POLICY_VAL}' -ErrorAction SilentlyContinue).{DNS_POLICY_VAL}"
+    ))
+    .ok()
+    .and_then(|s| s.trim().parse::<u32>().ok());
+    let _ = pwsh(&format!(
+        "Set-DnsClientServerAddress -InterfaceAlias '{alias}' -ServerAddresses {dns} -ErrorAction SilentlyContinue; \
+         Set-NetIPInterface -InterfaceAlias '{alias}' -InterfaceMetric 1 -ErrorAction SilentlyContinue; \
+         if (-not (Test-Path '{DNS_POLICY_KEY}')) {{ New-Item -Path '{DNS_POLICY_KEY}' -Force | Out-Null }}; \
+         Set-ItemProperty -Path '{DNS_POLICY_KEY}' -Name '{DNS_POLICY_VAL}' -Value 1 -Type DWord -ErrorAction SilentlyContinue"
+    ));
+    prior
+}
+
+/// Reverse [`harden_client_dns`]: reset the tunnel interface DNS and restore the
+/// prior multi-homed resolution policy (deleting our value if it was unset).
+pub fn restore_client_dns(alias: &str, prior: Option<u32>) {
+    let restore_policy = match prior {
+        Some(v) => format!(
+            "Set-ItemProperty -Path '{DNS_POLICY_KEY}' -Name '{DNS_POLICY_VAL}' -Value {v} -Type DWord -ErrorAction SilentlyContinue"
+        ),
+        None => format!(
+            "Remove-ItemProperty -Path '{DNS_POLICY_KEY}' -Name '{DNS_POLICY_VAL}' -ErrorAction SilentlyContinue"
+        ),
+    };
+    let _ = pwsh(&format!(
+        "Set-DnsClientServerAddress -InterfaceAlias '{alias}' -ResetServerAddresses -ErrorAction SilentlyContinue; {restore_policy}"
     ));
 }
 
@@ -121,24 +168,22 @@ pub fn default_gateway() -> Option<(String, u32)> {
 /// without deleting it, which makes teardown clean and reliable.
 pub fn add_full_tunnel_routes(alias: &str, gateway: &str) -> Result<()> {
     ensure_ip(gateway)?;
-    for prefix in ["0.0.0.0/1", "128.0.0.0/1"] {
-        let _ = pwsh(&format!(
-            "Remove-NetRoute -DestinationPrefix '{prefix}' -InterfaceAlias '{alias}' -Confirm:$false -ErrorAction SilentlyContinue"
-        ));
-        pwsh(&format!(
-            "New-NetRoute -DestinationPrefix '{prefix}' -InterfaceAlias '{alias}' -NextHop {gateway} -RouteMetric 1 -ErrorAction Stop | Out-Null"
-        ))?;
-    }
-    Ok(())
+    pwsh(&format!(
+        "$ErrorActionPreference='Stop'; \
+         foreach ($p in '0.0.0.0/1','128.0.0.0/1') {{ \
+           Remove-NetRoute -DestinationPrefix $p -InterfaceAlias '{alias}' -Confirm:$false -ErrorAction SilentlyContinue; \
+           New-NetRoute -DestinationPrefix $p -InterfaceAlias '{alias}' -NextHop {gateway} -RouteMetric 1 | Out-Null \
+         }}"
+    ))
 }
 
 /// Remove the split-default tunnel routes.
 pub fn remove_full_tunnel_routes(alias: &str) {
-    for prefix in ["0.0.0.0/1", "128.0.0.0/1"] {
-        let _ = pwsh(&format!(
-            "Remove-NetRoute -DestinationPrefix '{prefix}' -InterfaceAlias '{alias}' -Confirm:$false -ErrorAction SilentlyContinue"
-        ));
-    }
+    let _ = pwsh(&format!(
+        "foreach ($p in '0.0.0.0/1','128.0.0.0/1') {{ \
+           Remove-NetRoute -DestinationPrefix $p -InterfaceAlias '{alias}' -Confirm:$false -ErrorAction SilentlyContinue \
+         }}"
+    ));
 }
 
 /// Pin a single carrier address to the physical gateway so the tunnel's own
@@ -189,21 +234,19 @@ pub fn remove_nat(name: &str) {
 /// the (IPv4-only) tunnel adapter, where it is dropped. Prevents IPv6 leaks.
 /// Best-effort: failures are non-fatal. `alias` is a trusted constant.
 pub fn add_ipv6_killswitch(alias: &str) {
-    for prefix in ["::/1", "8000::/1"] {
-        let _ = pwsh(&format!(
-            "Remove-NetRoute -DestinationPrefix '{prefix}' -InterfaceAlias '{alias}' -Confirm:$false -ErrorAction SilentlyContinue"
-        ));
-        let _ = pwsh(&format!(
-            "New-NetRoute -DestinationPrefix '{prefix}' -InterfaceAlias '{alias}' -RouteMetric 1 -ErrorAction SilentlyContinue | Out-Null"
-        ));
-    }
+    let _ = pwsh(&format!(
+        "foreach ($p in '::/1','8000::/1') {{ \
+           Remove-NetRoute -DestinationPrefix $p -InterfaceAlias '{alias}' -Confirm:$false -ErrorAction SilentlyContinue; \
+           New-NetRoute -DestinationPrefix $p -InterfaceAlias '{alias}' -RouteMetric 1 -ErrorAction SilentlyContinue | Out-Null \
+         }}"
+    ));
 }
 
 /// Remove the IPv6 leak kill-switch routes.
 pub fn remove_ipv6_killswitch(alias: &str) {
-    for prefix in ["::/1", "8000::/1"] {
-        let _ = pwsh(&format!(
-            "Remove-NetRoute -DestinationPrefix '{prefix}' -InterfaceAlias '{alias}' -Confirm:$false -ErrorAction SilentlyContinue"
-        ));
-    }
+    let _ = pwsh(&format!(
+        "foreach ($p in '::/1','8000::/1') {{ \
+           Remove-NetRoute -DestinationPrefix $p -InterfaceAlias '{alias}' -Confirm:$false -ErrorAction SilentlyContinue \
+         }}"
+    ));
 }

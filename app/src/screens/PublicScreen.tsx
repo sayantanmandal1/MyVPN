@@ -37,6 +37,7 @@ export function PublicScreen({
   servers,
   status,
   loading,
+  error,
   busy,
   onRefresh,
   onConnect,
@@ -45,6 +46,7 @@ export function PublicScreen({
   servers: PublicServer[];
   status: PublicStatus;
   loading: boolean;
+  error?: string | null;
   busy: boolean;
   onRefresh: () => void;
   onConnect: (serverId: string) => void;
@@ -56,6 +58,7 @@ export function PublicScreen({
   const connecting = status.state === "connecting";
   const connected = status.state === "connected";
   const active = connecting || connected;
+  const errored = status.state === "error";
 
   const countries = useMemo<CountryGroup[]>(() => {
     const m = new Map<string, CountryGroup>();
@@ -160,6 +163,21 @@ export function PublicScreen({
         </div>
       )}
 
+      {/* Connection failure — surfaces OpenVPN's own reason from its log. */}
+      {errored && status.message && (
+        <div className="mb-4 flex items-start gap-3 rounded-2xl border border-[color:var(--color-danger)]/30 bg-[color:var(--color-danger)]/5 px-4 py-3">
+          <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-[color:var(--color-danger)]" />
+          <div className="min-w-0">
+            <div className="text-sm font-semibold text-[color:var(--color-danger)]">
+              Couldn't connect
+            </div>
+            <div className="mt-0.5 text-xs leading-relaxed break-words text-[color:var(--color-muted)]">
+              {status.message}
+            </div>
+          </div>
+        </div>
+      )}
+
       <TextField
         value={query}
         onChange={(e) => setQuery(e.target.value)}
@@ -172,12 +190,24 @@ export function PublicScreen({
       <div className="glass min-h-0 flex-1 divide-y divide-white/5 overflow-y-auto rounded-2xl">
         {countries.length === 0 ? (
           <div className="grid h-full min-h-40 place-items-center p-8 text-center">
-            <div className="text-sm text-[color:var(--color-muted)]">
-              {loading
-                ? "Loading servers…"
-                : servers.length === 0
-                  ? "No servers loaded yet. Click Refresh to fetch the list."
-                  : "No countries match your search."}
+            <div className="max-w-md text-sm text-[color:var(--color-muted)]">
+              {loading ? (
+                "Loading servers…"
+              ) : error ? (
+                <>
+                  <span className="font-medium text-[color:var(--color-danger)]">
+                    Couldn't load servers.
+                  </span>
+                  <span className="mt-1 block text-xs break-words text-[color:var(--color-faint)]">
+                    {error}
+                  </span>
+                  <span className="mt-2 block text-xs">Click Refresh to try again.</span>
+                </>
+              ) : servers.length === 0 ? (
+                "No servers loaded yet. Click Refresh to fetch the list."
+              ) : (
+                "No countries match your search."
+              )}
             </div>
           </div>
         ) : (

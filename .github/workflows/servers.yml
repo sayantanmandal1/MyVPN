@@ -1,0 +1,51 @@
+name: Refresh public server list
+
+# Mirrors the VPN Gate public server list into the `vpn-data` branch so the app
+# can fetch it from GitHub. VPN Gate's website blocks automated clients (a WAF
+# returns 403 on most networks), but a GitHub Actions runner can reach it, and
+# GitHub raw content is never WAF/VPN-blocked. This keeps the in-app "Free
+# servers" list working reliably AND keeps you in control of the data — the
+# servers come straight from VPN Gate via your own repo, not a third party.
+
+on:
+  schedule:
+    - cron: "0 * * * *" # hourly
+  workflow_dispatch: {} # lets you run it on demand from the Actions tab
+  push:
+    paths:
+      - ".github/workflows/servers.yml" # populate immediately when first added
+
+permissions:
+  contents: write
+
+# Only one refresh at a time; newer runs supersede older ones.
+concurrency:
+  group: refresh-servers
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the latest VPN Gate list
+        run: |
+          curl -fsS --retry 3 --retry-delay 5 \
+            -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) MyVPN" \
+            "https://www.vpngate.net/api/iphone/" -o servers.csv
+          # Refuse to publish junk: the file must be non-empty and look like the
+          # VPN Gate CSV (otherwise keep the previous good data).
+          test -s servers.csv
+          grep -q "OpenVPN_ConfigData_Base64" servers.csv \
+            || grep -q "vpn_servers" servers.csv
+
+      - name: Publish to the vpn-data branch
+        run: |
+          git init -q .
+          git checkout -q -b vpn-data
+          git add servers.csv
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "Refresh public server list ($(date -u '+%Y-%m-%d %H:%M UTC'))"
+          git push -f -q \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" \
+            vpn-data

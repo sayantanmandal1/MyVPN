@@ -105,6 +105,10 @@ pub struct ConnectConfig {
     pub ticket: Option<String>,
     /// A raw endpoint id, if connecting directly.
     pub endpoint_id: Option<String>,
+    /// A pre-hashed passphrase proof, used to reconnect to a saved/trusted host
+    /// without re-entering the passphrase.
+    #[serde(default)]
+    pub proof: Option<String>,
 }
 
 /// Persisted user settings (stored via the Tauri store plugin).
@@ -200,4 +204,14 @@ impl Default for PublicStatus {
             connected_secs: 0,
         }
     }
+}
+
+/// Information about a newer available release, surfaced to the UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInfo {
+    /// The new version, e.g. "0.2.0".
+    pub version: String,
+    /// The release page URL to open in the browser.
+    pub url: String,
 }

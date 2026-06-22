@@ -29,6 +29,7 @@ pub fn run() {
                 let _ = w.set_focus();
             }
         }));
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
     }
 
     builder
@@ -106,6 +107,8 @@ pub fn run() {
             commands::public_connect,
             commands::public_disconnect,
             commands::public_status,
+            commands::check_update,
+            commands::install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MyVPN");

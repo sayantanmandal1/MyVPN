@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence } from "framer-motion";
+import { Download, X } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { getVersion } from "@tauri-apps/api/app";
 import { Sidebar, type Route } from "./components/Sidebar";
 import { Dashboard } from "./screens/Dashboard";
 import { HostScreen } from "./screens/HostScreen";
 import { ConnectScreen } from "./screens/ConnectScreen";
 import { SettingsScreen } from "./screens/SettingsScreen";
 import { PublicScreen } from "./screens/PublicScreen";
+import { Button } from "./components/ui/Button";
 import {
   api,
   events,
@@ -14,6 +18,7 @@ import {
   type PublicStatus,
   type Settings,
   type StatusSnapshot,
+  type UpdateInfo,
 } from "./lib/api";
 
 const HISTORY_LEN = 32;
@@ -71,6 +76,10 @@ function App() {
   const [publicStatus, setPublicStatus] = useState<PublicStatus>(IDLE_PUBLIC);
   const [publicServers, setPublicServers] = useState<PublicServer[]>([]);
   const [publicLoading, setPublicLoading] = useState(false);
+  const [publicError, setPublicError] = useState<string | null>(null);
+  const [update, setUpdate] = useState<UpdateInfo | null>(null);
+  const [updating, setUpdating] = useState(false);
+  const [appVersion, setAppVersion] = useState("");
 
   const pushLog = useCallback((msg: string) => {
     const line = `${new Date().toLocaleTimeString()}  ${msg}`;
@@ -89,6 +98,8 @@ function App() {
     api.getAutostart().then(setAutostartEnabled).catch(() => {});
     api.listDiscovered().then(setDiscovered).catch(() => {});
     api.publicStatus().then(setPublicStatus).catch(() => {});
+    api.checkUpdate().then(setUpdate).catch(() => {});
+    getVersion().then(setAppVersion).catch(() => {});
 
     const unsubs = [
       events.onStatus((s) => {
@@ -126,8 +137,11 @@ function App() {
       setPublicLoading(true);
       api
         .publicServers()
-        .then(setPublicServers)
-        .catch(() => {})
+        .then((s) => {
+          setPublicServers(s);
+          setPublicError(null);
+        })
+        .catch((e) => setPublicError(String(e)))
         .finally(() => setPublicLoading(false));
     }
   }, [route]);
@@ -186,6 +200,9 @@ function App() {
       try {
         await api.publicRefresh();
         setPublicServers(await api.publicServers());
+        setPublicError(null);
+      } catch (e) {
+        setPublicError(String(e));
       } finally {
         setPublicLoading(false);
       }
@@ -220,6 +237,14 @@ function App() {
 
   const handleQuit = () => api.quitApp();
 
+  // Manual update check (from Settings). Returns the update so the caller can
+  // show inline feedback; also surfaces the top banner when one is found.
+  const handleCheckUpdate = useCallback(async (): Promise<UpdateInfo | null> => {
+    const found = await api.checkUpdate().catch(() => null);
+    setUpdate(found);
+    return found;
+  }, []);
+
   return (
     <div className="flex h-screen gap-4 p-4">
       <Sidebar
@@ -228,65 +253,104 @@ function App() {
         state={status.state}
         role={status.role}
       />
-      <main className="min-w-0 flex-1 overflow-hidden">
-        <AnimatePresence mode="wait">
-          {route === "dashboard" && (
-            <Dashboard
-              key="dashboard"
-              status={status}
-              historyUp={historyUp}
-              historyDown={historyDown}
-              logs={logs}
-              busy={busy}
-              onNavigate={setRoute}
-              onDisconnect={handleDisconnect}
-              onStopHost={handleStopHost}
-            />
-          )}
-          {route === "host" && (
-            <HostScreen
-              key="host"
-              status={status}
-              busy={busy}
-              onStartHost={handleStartHost}
-              onStopHost={handleStopHost}
-              generateTicket={api.generateTicket}
-            />
-          )}
-          {route === "connect" && (
-            <ConnectScreen
-              key="connect"
-              status={status}
-              discovered={discovered}
-              busy={busy}
-              onConnect={handleConnect}
-              onRefresh={handleRefresh}
-              onDisconnect={handleDisconnect}
-            />
-          )}
-          {route === "public" && (
-            <PublicScreen
-              key="public"
-              servers={publicServers}
-              status={publicStatus}
-              loading={publicLoading}
-              busy={busy}
-              onRefresh={handlePublicRefresh}
-              onConnect={handlePublicConnect}
-              onDisconnect={handlePublicDisconnect}
-            />
-          )}
-          {route === "settings" && (
-            <SettingsScreen
-              key="settings"
-              settings={settings}
-              autostartEnabled={autostartEnabled}
-              onToggleAutostart={handleToggleAutostart}
-              onChange={handleChangeSettings}
-              onQuit={handleQuit}
-            />
-          )}
-        </AnimatePresence>
+      <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        {update && (
+          <div className="mb-3 flex items-center gap-3 rounded-2xl border border-accent/25 bg-[color:var(--color-accent-dim)] px-4 py-2.5">
+            <Download className="h-4 w-4 shrink-0 text-accent" />
+            <div className="min-w-0 flex-1 text-sm">
+              <span className="font-medium">MyVPN {update.version}</span>
+              <span className="text-[color:var(--color-muted)]"> is available.</span>
+            </div>
+            <Button
+              size="sm"
+              variant="primary"
+              disabled={updating}
+              onClick={async () => {
+                setUpdating(true);
+                try {
+                  // Installs the signed update and relaunches when configured.
+                  await api.installUpdate();
+                } catch {
+                  // fall through to a manual download
+                }
+                // Reached only if the app didn't relaunch (updater not ready).
+                openUrl(update.url).catch(() => {});
+                setUpdating(false);
+              }}
+            >
+              {updating ? "Updating\u2026" : "Update"}
+            </Button>
+            <button
+              aria-label="Dismiss update notice"
+              onClick={() => setUpdate(null)}
+              className="rounded-lg p-1 text-[color:var(--color-muted)] transition hover:bg-white/10 hover:text-ink"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        )}
+        <div className="min-h-0 flex-1">
+          <AnimatePresence mode="wait">
+            {route === "dashboard" && (
+              <Dashboard
+                key="dashboard"
+                status={status}
+                historyUp={historyUp}
+                historyDown={historyDown}
+                logs={logs}
+                busy={busy}
+                onNavigate={setRoute}
+                onDisconnect={handleDisconnect}
+                onStopHost={handleStopHost}
+              />
+            )}
+            {route === "host" && (
+              <HostScreen
+                key="host"
+                status={status}
+                busy={busy}
+                onStartHost={handleStartHost}
+                onStopHost={handleStopHost}
+              />
+            )}
+            {route === "connect" && (
+              <ConnectScreen
+                key="connect"
+                status={status}
+                discovered={discovered}
+                busy={busy}
+                onConnect={handleConnect}
+                onRefresh={handleRefresh}
+                onDisconnect={handleDisconnect}
+              />
+            )}
+            {route === "public" && (
+              <PublicScreen
+                key="public"
+                servers={publicServers}
+                status={publicStatus}
+                loading={publicLoading}
+                error={publicError}
+                busy={busy}
+                onRefresh={handlePublicRefresh}
+                onConnect={handlePublicConnect}
+                onDisconnect={handlePublicDisconnect}
+              />
+            )}
+            {route === "settings" && (
+              <SettingsScreen
+                key="settings"
+                settings={settings}
+                autostartEnabled={autostartEnabled}
+                appVersion={appVersion}
+                onToggleAutostart={handleToggleAutostart}
+                onChange={handleChangeSettings}
+                onCheckUpdate={handleCheckUpdate}
+                onQuit={handleQuit}
+              />
+            )}
+          </AnimatePresence>
+        </div>
       </main>
     </div>
   );

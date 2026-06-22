@@ -1,7 +1,21 @@
 name: Release
 
-# Triggered by: git tag v0.0.1 && git push --tags
+# Two ways to cut a release:
+#   1. Manually (recommended): Actions tab -> "Release" -> Run workflow -> pick
+#      patch / minor / major. This bumps the version in every file, tags it,
+#      then builds and publishes — no local editing or tagging needed.
+#   2. By tag: `git tag vX.Y.Z && git push --tags` builds and publishes that tag.
 on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Semantic version bump"
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
   push:
     tags:
       - "v*"
@@ -10,8 +24,56 @@ permissions:
   contents: write
 
 jobs:
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      ref: ${{ steps.v.outputs.ref }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute and (when manual) bump version
+        id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            echo "ref=$GITHUB_REF" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CUR=$(grep -m1 '^version = ' app/src-tauri/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          IFS='.' read -r MA MI PA <<< "$CUR"
+          case "${{ inputs.bump }}" in
+            major) MA=$((MA+1)); MI=0; PA=0 ;;
+            minor) MI=$((MI+1)); PA=0 ;;
+            *)     PA=$((PA+1)) ;;
+          esac
+          VERSION="$MA.$MI.$PA"
+          TAG="v$VERSION"
+          echo "Bumping $CUR -> $VERSION"
+          sed -i -E "0,/^version = \"[^\"]+\"/s//version = \"$VERSION\"/" app/src-tauri/Cargo.toml
+          node -e "for (const f of ['app/src-tauri/tauri.conf.json','app/package.json','web/package.json']) { const fs=require('fs'); const j=JSON.parse(fs.readFileSync(f,'utf8')); j.version='$VERSION'; fs.writeFileSync(f, JSON.stringify(j, null, 2) + '\n'); }"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "release: $TAG"
+          git tag "$TAG"
+          git push origin "HEAD:${GITHUB_REF_NAME}" "refs/tags/$TAG"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "ref=$TAG" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build Windows installer
+    needs: version
     runs-on: windows-latest
 
     env:
@@ -23,6 +85,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.ref }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -70,12 +134,17 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signs the updater artifacts and generates latest.json when set.
+          # Generate a keypair with `npm run tauri signer generate` and store the
+          # private key (and its password) as these repository secrets.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: app
-          tagName: ${{ github.ref_name }}
-          releaseName: "MyVPN ${{ github.ref_name }}"
+          tagName: ${{ needs.version.outputs.tag }}
+          releaseName: "MyVPN ${{ needs.version.outputs.tag }}"
           releaseBody: |
-            ## MyVPN ${{ github.ref_name }}
+            ## MyVPN ${{ needs.version.outputs.tag }}
 
             Serverless peer-to-peer VPN. Download the Windows installer below.
 
@@ -93,5 +162,5 @@ jobs:
           if (-not $exe) { throw "No NSIS installer found to attach." }
           $stable = Join-Path $exe.Directory.FullName "MyVPN-Setup-x64.exe"
           Copy-Item $exe.FullName $stable -Force
-          Write-Host "Uploading $($stable) to release ${{ github.ref_name }}"
-          gh release upload ${{ github.ref_name }} "$stable" --clobber --repo ${{ github.repository }}
+          Write-Host "Uploading $($stable) to release ${{ needs.version.outputs.tag }}"
+          gh release upload ${{ needs.version.outputs.tag }} "$stable" --clobber --repo ${{ github.repository }}

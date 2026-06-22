@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { Download } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Logo } from "@/components/site/logo";
@@ -47,6 +48,12 @@ export function Navbar() {
               {l.label}
             </a>
           ))}
+          <Link
+            href="/changelog"
+            className="rounded-lg px-3 py-2 text-sm text-[color:var(--color-muted)] transition hover:text-ink"
+          >
+            Changelog
+          </Link>
         </div>
 
         <div className="ml-auto flex items-center gap-2 md:ml-0">

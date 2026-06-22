@@ -159,6 +159,35 @@ pub fn hash_pass(passphrase: &str) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Derive a deterministic iroh identity from a network name and its passphrase
+/// proof. A passphrase-protected host binds this identity, so a remote client
+/// that knows the name + passphrase can compute the same endpoint id (see
+/// [`derived_endpoint_id`]) and dial it through iroh's global discovery — no
+/// pairing code required.
+///
+/// Security: anyone who knows the name + passphrase can derive this identity —
+/// that *is* the intended shared secret, and the handshake still verifies the
+/// passphrase proof. Choose a strong passphrase, or use a pairing code (a
+/// random, non-derivable identity) when you don't want name-based discovery.
+pub fn derive_secret(name: &str, proof: &str) -> SecretKey {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"myvpn-net-identity:v1");
+    hasher.update(name.trim().to_lowercase().as_bytes());
+    hasher.update([0u8]);
+    hasher.update(proof.as_bytes());
+    let digest = hasher.finalize();
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&digest);
+    SecretKey::from_bytes(&seed)
+}
+
+/// The endpoint id (pairing code / dial target) of the identity derived from a
+/// network name and passphrase proof.
+pub fn derived_endpoint_id(name: &str, proof: &str) -> String {
+    derive_secret(name, proof).public().to_string()
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -206,6 +235,7 @@ pub async fn host_serve(
     session: Option<Arc<wintun::Session>>,
     slot: ClientSlot,
     down: Arc<AtomicU64>,
+    rtt: Arc<AtomicU64>,
 ) -> anyhow::Result<()> {
     let (mut send, mut recv) = conn.accept_bi().await.context("accept stream")?;
     let raw = read_frame(&mut recv).await?;
@@ -229,29 +259,18 @@ pub async fn host_serve(
         }
     }
 
-    // Admit a single active client at a time; reject extras cleanly.
+    // Single tunnel IP => one active client. A newly authenticated peer takes
+    // over the slot: this is almost always the same device reconnecting after a
+    // network blip, before the old connection's idle timeout fires — so eviction
+    // (rather than rejection) makes reconnects fast instead of stalling for tens
+    // of seconds. The previous connection's sender then drains and exits.
     let my_gen = HOST_GEN.fetch_add(1, Ordering::Relaxed);
     let mut pump: Option<(tokio::sync::mpsc::UnboundedReceiver<Bytes>, Arc<wintun::Session>)> =
         None;
-    let mut rejected = false;
     if let Some(s) = session.as_ref() {
-        let mut g = slot.lock();
-        if g.is_some() {
-            rejected = true;
-        } else {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
-            *g = Some((my_gen, tx));
-            pump = Some((rx, s.clone()));
-        }
-    }
-    if rejected {
-        let nack = HelloAck {
-            ok: false,
-            host_name: host_name.clone(),
-            message: "Host is already serving another device".to_string(),
-        };
-        let _ = write_frame(&mut send, &serde_json::to_vec(&nack)?).await;
-        anyhow::bail!("host already serving a client");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        *slot.lock() = Some((my_gen, tx));
+        pump = Some((rx, s.clone()));
     }
 
     tracing::info!("peer joined \"{}\" (client v{})", host_name, hello.version);
@@ -265,9 +284,11 @@ pub async fn host_serve(
     if let Some((rx, s)) = pump {
         let sender = spawn_datagram_sender(conn.clone(), rx);
         let writer = spawn_tun_writer(conn.clone(), s, down);
+        let sampler = spawn_rtt_sampler(conn.clone(), rtt);
         let _ = conn.closed().await;
         sender.abort();
         writer.abort();
+        sampler.abort();
         // Release the slot if we still own it.
         let mut g = slot.lock();
         if g.as_ref().map(|(gen, _)| *gen) == Some(my_gen) {
@@ -283,17 +304,14 @@ pub async fn host_serve(
 /// forwards them to the active peer via the slot's channel. Exits when the
 /// session is shut down. Used by both the host gateway and the client tunnel.
 pub fn spawn_session_reader(session: Arc<wintun::Session>, slot: ClientSlot, up: Arc<AtomicU64>) {
-    std::thread::spawn(move || loop {
-        match session.receive_blocking() {
-            Ok(packet) => {
-                let target = slot.lock().as_ref().map(|(_, tx)| tx.clone());
-                if let Some(tx) = target {
-                    let data = packet.bytes();
-                    up.fetch_add(data.len() as u64, Ordering::Relaxed);
-                    let _ = tx.send(Bytes::copy_from_slice(data));
-                }
+    std::thread::spawn(move || {
+        while let Ok(packet) = session.receive_blocking() {
+            let target = slot.lock().as_ref().map(|(_, tx)| tx.clone());
+            if let Some(tx) = target {
+                let data = packet.bytes();
+                up.fetch_add(data.len() as u64, Ordering::Relaxed);
+                let _ = tx.send(Bytes::copy_from_slice(data));
             }
-            Err(_) => break,
         }
     });
 }
@@ -305,16 +323,18 @@ pub fn spawn_tun_writer(
     down: Arc<AtomicU64>,
 ) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
-        loop {
-            match conn.read_datagram().await {
-                Ok(data) => {
-                    down.fetch_add(data.len() as u64, Ordering::Relaxed);
-                    if let Ok(mut packet) = session.allocate_send_packet(data.len() as u16) {
-                        packet.bytes_mut().copy_from_slice(&data);
-                        session.send_packet(packet);
-                    }
-                }
-                Err(_) => break,
+        while let Ok(data) = conn.read_datagram().await {
+            // A tunnelled IP packet never exceeds the adapter MTU; ignore
+            // anything empty or larger than a Wintun packet can hold
+            // (defensive: avoids a truncating cast + copy_from_slice panic
+            // that would tear down the data plane).
+            if data.is_empty() || data.len() > u16::MAX as usize {
+                continue;
+            }
+            down.fetch_add(data.len() as u64, Ordering::Relaxed);
+            if let Ok(mut packet) = session.allocate_send_packet(data.len() as u16) {
+                packet.bytes_mut().copy_from_slice(&data);
+                session.send_packet(packet);
             }
         }
     })
@@ -330,6 +350,37 @@ pub fn spawn_datagram_sender(
             if conn.send_datagram(pkt).is_err() {
                 break;
             }
+        }
+    })
+}
+
+/// The current best (lowest) path round-trip time for this connection, in
+/// milliseconds, or `None` if no path has a measured RTT yet.
+pub fn current_rtt_ms(conn: &Connection) -> Option<u64> {
+    let mut best: Option<std::time::Duration> = None;
+    for path in conn.paths().iter() {
+        let r = path.rtt();
+        if r > std::time::Duration::ZERO {
+            best = Some(best.map_or(r, |b| b.min(r)));
+        }
+    }
+    best.map(|d| d.as_millis() as u64)
+}
+
+/// Sample the connection RTT once per second into a shared counter so the stats
+/// ticker can surface live latency. Stores 0 when no path RTT is known yet.
+/// Exits when the connection closes.
+pub fn spawn_rtt_sampler(
+    conn: Connection,
+    rtt_ms: Arc<AtomicU64>,
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if conn.close_reason().is_some() {
+                break;
+            }
+            rtt_ms.store(current_rtt_ms(&conn).unwrap_or(0), Ordering::Relaxed);
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     })
 }

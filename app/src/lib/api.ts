@@ -93,6 +93,11 @@ export interface PublicStatus {
   connectedSecs: number;
 }
 
+export interface UpdateInfo {
+  version: string;
+  url: string;
+}
+
 // ---- Command wrappers ----
 
 export const api = {
@@ -119,6 +124,8 @@ export const api = {
     invoke<PublicStatus>("public_connect", { serverId }),
   publicDisconnect: () => invoke<void>("public_disconnect"),
   publicStatus: () => invoke<PublicStatus>("public_status"),
+  checkUpdate: () => invoke<UpdateInfo | null>("check_update"),
+  installUpdate: () => invoke<boolean>("install_update"),
 };
 
 // ---- Event subscriptions ----

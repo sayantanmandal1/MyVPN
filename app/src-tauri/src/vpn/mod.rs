@@ -53,8 +53,12 @@ struct Inner {
     tun: Option<tun::Tun>,
     bypass_ips: Vec<String>,
     nat_name: Option<String>,
+    /// Prior smart-multihomed-DNS policy value to restore on teardown; the outer
+    /// `Some` means client DNS-leak hardening is currently active.
+    dns_guard: Option<Option<u32>>,
     up: Arc<AtomicU64>,
     down: Arc<AtomicU64>,
+    rtt_ms: Arc<AtomicU64>,
     started_at: Option<Instant>,
 }
 
@@ -73,8 +77,8 @@ impl VpnEngine {
     pub fn new(app: AppHandle, key_dir: PathBuf) -> Self {
         let lan_hosts: discovery::HostTable =
             Arc::new(Mutex::new(std::collections::HashMap::new()));
-        // Listen for LAN host beacons for the lifetime of the app.
-        let _ = discovery::spawn_listener(app.clone(), lan_hosts.clone());
+        // Listen for LAN host beacons for the lifetime of the app (detached).
+        drop(discovery::spawn_listener(app.clone(), lan_hosts.clone()));
         Self {
             app,
             key_dir,
@@ -117,9 +121,16 @@ impl VpnEngine {
     ) -> Result<StatusSnapshot> {
         self.teardown().await;
 
-        // Bind a real iroh endpoint with a stable, persisted identity.
-        let secret =
-            iroh_transport::load_or_create_secret(&self.identity_path()).map_err(to_err)?;
+        // A passphrase-protected network binds a deterministic identity derived
+        // from (name, proof), so remote devices can find it by name + passphrase
+        // through iroh's global discovery (no pairing code needed). An open
+        // network keeps this device's stable, persisted identity.
+        let secret = match expected_proof.as_deref() {
+            Some(proof) => iroh_transport::derive_secret(&network_name, proof),
+            None => {
+                iroh_transport::load_or_create_secret(&self.identity_path()).map_err(to_err)?
+            }
+        };
         let relay = self.relay.lock().clone();
         let node = IrohNode::bind_host(secret, relay).await.map_err(to_err)?;
         let endpoint_id = node.id_string();
@@ -128,6 +139,7 @@ impl VpnEngine {
         let host_session = self.setup_host_gateway();
         let data_plane = host_session.is_some();
         let down = self.inner.lock().down.clone();
+        let rtt = self.inner.lock().rtt_ms.clone();
 
         {
             let mut g = self.inner.lock();
@@ -142,7 +154,7 @@ impl VpnEngine {
                 message: Some(if data_plane {
                     "Hosting — waiting for peers to connect".to_string()
                 } else {
-                    "Hosting (control-plane only — run MyVPN as Administrator to route traffic)"
+                    "Hosting (control-plane only — the VPN driver is unavailable; reinstall MyVPN)"
                         .to_string()
                 }),
                 ..Default::default()
@@ -166,7 +178,7 @@ impl VpnEngine {
         let online_msg: &str = if data_plane {
             "Hosting — online and reachable"
         } else {
-            "Hosting (control-plane only — run MyVPN as Administrator to route traffic)"
+            "Hosting (control-plane only — the VPN driver is unavailable; reinstall MyVPN)"
         };
         let accept = tauri::async_runtime::spawn(async move {
             node.wait_online().await;
@@ -188,6 +200,7 @@ impl VpnEngine {
                 let proof = expected_proof.clone();
                 let slot = current_client.clone();
                 let down = down.clone();
+                let rtt = rtt.clone();
                 {
                     let mut g = inner.lock();
                     g.snapshot.message = Some("Peer connected".to_string());
@@ -197,7 +210,8 @@ impl VpnEngine {
                 let _ = app.emit(EVT_LOG, "A peer connected to your network");
                 tauri::async_runtime::spawn(async move {
                     if let Err(e) =
-                        iroh_transport::host_serve(conn, hn, proof, session, slot, down).await
+                        iroh_transport::host_serve(conn, hn, proof, session, slot, down, rtt)
+                            .await
                     {
                         tracing::warn!("peer connection ended: {e}");
                     }
@@ -226,9 +240,7 @@ impl VpnEngine {
                     self.log(format!("Enable forwarding failed: {e}"));
                 }
                 if let Err(e) = net::create_nat(NAT_NAME, SUBNET) {
-                    self.log(format!(
-                        "NAT setup failed (run as Administrator for full tunnel): {e}"
-                    ));
+                    self.log(format!("NAT setup failed: {e}"));
                 }
                 let session = t.session();
                 let up = self.inner.lock().up.clone();
@@ -283,11 +295,17 @@ impl VpnEngine {
                 }
             }
             if let Err(e) = net::add_full_tunnel_routes(VPN_IF, HOST_IP) {
-                self.log(format!("Route setup failed (run as Administrator): {e}"));
+                self.log(format!("Route setup failed: {e}"));
             }
             net::add_ipv6_killswitch(VPN_IF);
-            let _ = net::set_dns(VPN_IF, TUN_DNS);
-            self.inner.lock().bypass_ips = bypass;
+            // Force every DNS lookup through the tunnel resolver (no leaks to the
+            // local network), remembering the prior policy to restore on teardown.
+            let prior = net::harden_client_dns(VPN_IF, TUN_DNS);
+            {
+                let mut g = self.inner.lock();
+                g.bypass_ips = bypass;
+                g.dns_guard = Some(prior);
+            }
         } else {
             self.log("Could not determine the default gateway; full tunnel disabled.");
         }
@@ -309,6 +327,24 @@ impl VpnEngine {
 
     /// Connect to a host as a client (full-tunnel).
     pub async fn connect(&self, cfg: ConnectConfig) -> Result<StatusSnapshot> {
+        match self.try_connect(cfg).await {
+            Ok(snap) => Ok(snap),
+            Err(e) => {
+                // Never leave the UI stuck on "Connecting…": tear down any partial
+                // setup and surface a clear error state.
+                self.teardown().await;
+                self.commit(StatusSnapshot {
+                    state: ConnectionState::Error,
+                    message: Some(e.to_string()),
+                    ..Default::default()
+                });
+                self.log(format!("Connection failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    async fn try_connect(&self, cfg: ConnectConfig) -> Result<StatusSnapshot> {
         self.teardown().await;
         let name = cfg.network_name.clone();
 
@@ -321,10 +357,33 @@ impl VpnEngine {
         });
         self.log(format!("Connecting to \"{name}\""));
 
-        // Prefer an explicit code; otherwise resolve the name via LAN discovery.
+        // The passphrase proof authenticates us and (for name-based discovery)
+        // derives the host's deterministic identity.
+        let proof = cfg
+            .proof
+            .clone()
+            .filter(|p| !p.is_empty())
+            .or_else(|| {
+                cfg.passphrase
+                    .as_deref()
+                    .filter(|p| !p.is_empty())
+                    .map(iroh_transport::hash_pass)
+            });
+
+        // Resolve the dial target: an explicit pairing code wins; otherwise try
+        // same-LAN discovery by name; otherwise, with a passphrase, derive the
+        // host's deterministic identity so it can be found over the internet.
         let target = match resolve_target(&cfg) {
             Ok(t) => t,
-            Err(e) => discovery::find_by_name(&self.lan_hosts, &name).ok_or(e)?,
+            Err(e) => {
+                if let Some(id) = discovery::find_by_name(&self.lan_hosts, &name) {
+                    id
+                } else if let Some(p) = proof.as_deref() {
+                    iroh_transport::derived_endpoint_id(&name, p)
+                } else {
+                    return Err(e);
+                }
+            }
         };
 
         let secret =
@@ -332,11 +391,6 @@ impl VpnEngine {
         let relay = self.relay.lock().clone();
         let node = IrohNode::bind_client(secret, relay).await.map_err(to_err)?;
         let conn = node.connect(&target).await.map_err(to_err)?;
-        let proof = cfg
-            .passphrase
-            .as_deref()
-            .filter(|p| !p.is_empty())
-            .map(iroh_transport::hash_pass);
         let message = iroh_transport::client_handshake(&conn, &name, proof.clone())
             .await
             .map_err(to_err)?;
@@ -358,7 +412,7 @@ impl VpnEngine {
             g.snapshot.message = Some(if tunnel_up {
                 message
             } else {
-                "Connected (control-plane only — run MyVPN as Administrator to route traffic)"
+                "Connected (control-plane only — the VPN driver is unavailable; reinstall MyVPN)"
                     .to_string()
             });
         }
@@ -440,16 +494,18 @@ impl VpnEngine {
     /// tear down the TUN adapter, and close the node.
     async fn teardown(&self) {
         self.stop_ticker();
-        let (node, tasks, tun, bypass, nat) = {
+        let (node, tasks, tun, bypass, nat, dns_guard) = {
             let mut g = self.inner.lock();
             g.up.store(0, Ordering::Relaxed);
             g.down.store(0, Ordering::Relaxed);
+            g.rtt_ms.store(0, Ordering::Relaxed);
             (
                 g.node.take(),
                 std::mem::take(&mut g.net_tasks),
                 g.tun.take(),
                 std::mem::take(&mut g.bypass_ips),
                 g.nat_name.take(),
+                g.dns_guard.take(),
             )
         };
         for t in tasks {
@@ -460,7 +516,10 @@ impl VpnEngine {
         // Revert networking changes (each is a no-op if never applied).
         net::remove_full_tunnel_routes(VPN_IF);
         net::remove_ipv6_killswitch(VPN_IF);
-        net::reset_dns(VPN_IF);
+        match dns_guard {
+            Some(prior) => net::restore_client_dns(VPN_IF, prior),
+            None => net::reset_dns(VPN_IF),
+        }
         for ip in bypass {
             net::remove_bypass_route(&ip);
         }
@@ -480,9 +539,9 @@ impl VpnEngine {
     fn start_ticker(&self) {
         let inner = self.inner.clone();
         let app = self.app.clone();
-        let (up, down) = {
+        let (up, down, rtt_ms) = {
             let g = inner.lock();
-            (g.up.clone(), g.down.clone())
+            (g.up.clone(), g.down.clone(), g.rtt_ms.clone())
         };
         let handle = tauri::async_runtime::spawn(async move {
             let mut last_up = up.load(Ordering::Relaxed);
@@ -509,6 +568,9 @@ impl VpnEngine {
                     g.snapshot.stats.rate_up = rate_up;
                     g.snapshot.stats.rate_down = rate_down;
                     g.snapshot.stats.direct = active;
+                    let rtt = rtt_ms.load(Ordering::Relaxed);
+                    g.snapshot.stats.latency_ms =
+                        if active && rtt > 0 { Some(rtt as u32) } else { None };
                     g.snapshot.stats.clone()
                 };
                 if app.emit(EVT_STATS, stats).is_err() {
@@ -522,25 +584,47 @@ impl VpnEngine {
 
 /// Periodically pin iroh's current carrier addresses to the physical gateway,
 /// so the full-tunnel default route never swallows the tunnel's own traffic.
-fn spawn_bypass_refresher(
-    conn: Connection,
-    gateway: String,
-    if_index: u32,
-    inner: Arc<Mutex<Inner>>,
-) -> Task {
+/// Follows network changes (Wi-Fi <-> Ethernet, new DHCP lease) by re-pinning
+/// known carrier addresses to the new gateway. The (relatively expensive)
+/// gateway lookup only runs when there is a new address to pin or periodically,
+/// so a steady connection costs almost nothing.
+fn spawn_bypass_refresher(conn: Connection, inner: Arc<Mutex<Inner>>) -> Task {
     tauri::async_runtime::spawn(async move {
+        let mut last_gw: Option<(String, u32)> = None;
+        let mut tick: u32 = 0;
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
             if conn.close_reason().is_some() {
                 break;
             }
+            tick = tick.wrapping_add(1);
             let known: Vec<String> = inner.lock().bypass_ips.clone();
+            let current: Vec<String> = iroh_transport::remote_socket_addrs(&conn)
+                .iter()
+                .map(|a| a.ip().to_string())
+                .collect();
+            let has_new = current.iter().any(|ip| !known.contains(ip));
+            // Only shell out for the gateway when there's a new address to pin or
+            // periodically (~30s) to catch a silent network change.
+            if !has_new && tick < 10 {
+                continue;
+            }
+            tick = 0;
+            let Some((gw, idx)) = net::default_gateway() else {
+                continue;
+            };
+            // Network changed: re-pin every known carrier address to the new
+            // gateway so the tunnel's own QUIC traffic still bypasses the tunnel.
+            if last_gw.as_ref() != Some(&(gw.clone(), idx)) {
+                for ip in &known {
+                    net::remove_bypass_route(ip);
+                    let _ = net::add_bypass_route(ip, &gw, idx);
+                }
+                last_gw = Some((gw.clone(), idx));
+            }
             let mut added = Vec::new();
-            for addr in iroh_transport::remote_socket_addrs(&conn) {
-                let ip = addr.ip().to_string();
-                if !known.contains(&ip)
-                    && net::add_bypass_route(&ip, &gateway, if_index).is_ok()
-                {
+            for ip in current {
+                if !known.contains(&ip) && net::add_bypass_route(&ip, &gw, idx).is_ok() {
                     added.push(ip);
                 }
             }
@@ -571,6 +655,7 @@ fn spawn_client_supervisor(
     app: AppHandle,
 ) -> Task {
     tauri::async_runtime::spawn(async move {
+        let rtt_ms = inner.lock().rtt_ms.clone();
         loop {
             // Attach the data plane for the current connection. The persistent
             // reader forwards TUN packets to this connection via the slot.
@@ -578,9 +663,7 @@ fn spawn_client_supervisor(
                 Some(s) => {
                     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
                     *slot.lock() = Some((0, tx));
-                    let refresher = net::default_gateway().map(|(gw, idx)| {
-                        spawn_bypass_refresher(conn.clone(), gw, idx, inner.clone())
-                    });
+                    let refresher = Some(spawn_bypass_refresher(conn.clone(), inner.clone()));
                     (
                         Some(iroh_transport::spawn_datagram_sender(conn.clone(), rx)),
                         Some(iroh_transport::spawn_tun_writer(
@@ -593,6 +676,7 @@ fn spawn_client_supervisor(
                 }
                 None => (None, None, None),
             };
+            let sampler = iroh_transport::spawn_rtt_sampler(conn.clone(), rtt_ms.clone());
 
             // Block until this connection ends.
             let _ = conn.closed().await;
@@ -605,6 +689,7 @@ fn spawn_client_supervisor(
             if let Some(t) = refresher {
                 t.abort();
             }
+            sampler.abort();
 
             // If the engine has moved on (the user disconnected — teardown also
             // aborts this task), stop supervising.
@@ -625,6 +710,7 @@ fn spawn_client_supervisor(
                 g.snapshot.stats.direct = false;
                 g.snapshot.message = Some("Connection lost — reconnecting…".to_string());
             }
+            rtt_ms.store(0, Ordering::Relaxed);
             let snap = inner.lock().snapshot.clone();
             let _ = app.emit(EVT_STATUS, snap);
             let _ = app.emit(EVT_LOG, "Connection lost — reconnecting…");
@@ -633,8 +719,22 @@ fn spawn_client_supervisor(
             // The existing carrier-bypass routes keep the relay reachable while
             // the default route still points at the (down) tunnel.
             let mut delay = Duration::from_secs(1);
+            let mut last_gw: Option<(String, u32)> = None;
             loop {
                 tokio::time::sleep(delay).await;
+                // Follow network changes during the outage: keep carrier bypass
+                // routes pointed at the current gateway so the re-dial can reach
+                // the relay even if the user switched networks.
+                if let Some((gw, idx)) = net::default_gateway() {
+                    if last_gw.as_ref() != Some(&(gw.clone(), idx)) {
+                        let known: Vec<String> = inner.lock().bypass_ips.clone();
+                        for ip in &known {
+                            net::remove_bypass_route(ip);
+                            let _ = net::add_bypass_route(ip, &gw, idx);
+                        }
+                        last_gw = Some((gw, idx));
+                    }
+                }
                 if let Ok(c) = node.connect(&target).await {
                     if iroh_transport::client_handshake(&c, &name, proof.clone())
                         .await
@@ -677,8 +777,8 @@ fn resolve_target(cfg: &ConnectConfig) -> Result<String> {
         }
     }
     Err(VpnError::msg(
-        "Enter the host's pairing code to connect. (Typing just a name + \
-         passphrase will be supported once DHT discovery lands.)",
+        "Enter the host's pairing code, or the network name together with its \
+         passphrase, to connect.",
     ))
 }
 

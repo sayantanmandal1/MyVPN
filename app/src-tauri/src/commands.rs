@@ -1,6 +1,11 @@
 //! Tauri commands — the bridge between the React UI and the VPN engine.
 
 use std::sync::Arc;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_store::StoreExt;
@@ -53,6 +58,43 @@ fn load_host_proof(app: &AppHandle) -> Option<String> {
         .flatten()
 }
 
+// --- trusted devices -----------------------------------------------------
+// Hosts we've successfully connected to are remembered (with the proof we used)
+// so future connections are frictionless — no code or passphrase required.
+const SAVED_HOSTS_KEY: &str = "saved_hosts";
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SavedHost {
+    network_name: String,
+    endpoint_id: String,
+    proof: Option<String>,
+}
+
+fn load_saved_hosts(app: &AppHandle) -> Vec<SavedHost> {
+    app.store(STORE_FILE)
+        .ok()
+        .and_then(|s| s.get(SAVED_HOSTS_KEY))
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+
+fn remember_host(app: &AppHandle, host: SavedHost) {
+    if host.endpoint_id.is_empty() {
+        return;
+    }
+    let mut hosts = load_saved_hosts(app);
+    hosts.retain(|h| h.endpoint_id != host.endpoint_id);
+    hosts.insert(0, host);
+    hosts.truncate(16);
+    if let Ok(store) = app.store(STORE_FILE) {
+        if let Ok(value) = serde_json::to_value(&hosts) {
+            store.set(SAVED_HOSTS_KEY, value);
+            let _ = store.save();
+        }
+    }
+}
+
 // --- status / control ----------------------------------------------------
 
 #[tauri::command]
@@ -62,9 +104,25 @@ pub async fn get_status(engine: State<'_, Arc<VpnEngine>>) -> Result<StatusSnaps
 
 #[tauri::command]
 pub async fn list_discovered(
+    app: AppHandle,
     engine: State<'_, Arc<VpnEngine>>,
 ) -> Result<Vec<DiscoveredHost>> {
-    Ok(engine.list_discovered().await)
+    let mut hosts = engine.list_discovered().await;
+    let live: std::collections::HashSet<String> =
+        hosts.iter().map(|h| h.endpoint_id.clone()).collect();
+    // Append previously-trusted hosts that aren't currently visible on the LAN.
+    for saved in load_saved_hosts(&app) {
+        if !live.contains(&saved.endpoint_id) {
+            hosts.push(DiscoveredHost {
+                network_name: saved.network_name,
+                endpoint_id: saved.endpoint_id,
+                source: "saved".to_string(),
+                requires_passphrase: false,
+                online: false,
+            });
+        }
+    }
+    Ok(hosts)
 }
 
 #[tauri::command]
@@ -106,6 +164,7 @@ pub async fn stop_host(app: AppHandle, engine: State<'_, Arc<VpnEngine>>) -> Res
 
 #[tauri::command]
 pub async fn connect(
+    app: AppHandle,
     engine: State<'_, Arc<VpnEngine>>,
     public: State<'_, Arc<PublicVpn>>,
     config: ConnectConfig,
@@ -115,7 +174,46 @@ pub async fn connect(
             "Disconnect the public VPN before joining a private network.",
         ));
     }
-    engine.connect(config).await
+
+    let mut config = config;
+    // Trusted devices: with no passphrase supplied, reuse the saved proof for a
+    // host we've connected to before so reconnecting needs no authentication.
+    let has_secret = config.proof.as_deref().is_some_and(|p| !p.is_empty())
+        || config.passphrase.as_deref().is_some_and(|p| !p.is_empty());
+    if !has_secret {
+        let target = config.endpoint_id.clone().or_else(|| config.ticket.clone());
+        if let Some(found) = load_saved_hosts(&app).into_iter().find(|h| {
+            Some(&h.endpoint_id) == target.as_ref() || h.network_name == config.network_name
+        }) {
+            config.proof = found.proof;
+            if config.endpoint_id.is_none() && config.ticket.is_none() {
+                config.endpoint_id = Some(found.endpoint_id);
+            }
+        }
+    }
+
+    // Compute the proof we will actually present, so we can remember it.
+    let proof_used = config.proof.clone().filter(|p| !p.is_empty()).or_else(|| {
+        config
+            .passphrase
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(crate::vpn::hash_pass)
+    });
+
+    let snap = engine.connect(config.clone()).await?;
+
+    if let Some(endpoint_id) = snap.peer_endpoint_id.clone() {
+        remember_host(
+            &app,
+            SavedHost {
+                network_name: config.network_name.clone(),
+                endpoint_id,
+                proof: proof_used,
+            },
+        );
+    }
+    Ok(snap)
 }
 
 #[tauri::command]
@@ -165,6 +263,87 @@ pub async fn public_status(public: State<'_, Arc<PublicVpn>>) -> Result<PublicSt
     Ok(public.status())
 }
 
+// --- update check --------------------------------------------------------
+
+const UPDATE_REPO: &str = "sayantanmandal1/MyVPN";
+
+/// Check GitHub Releases for a newer version. Best-effort and privacy-light: a
+/// single GET of public release metadata (no identifiers sent). Returns the new
+/// version and release page URL, or `None` when already current or unreachable.
+#[tauri::command]
+pub async fn check_update() -> Result<Option<UpdateInfo>> {
+    let url = format!("https://api.github.com/repos/{UPDATE_REPO}/releases/latest");
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("MyVPN/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| VpnError::msg(e.to_string()))?;
+    let resp = match client.get(url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        _ => return Ok(None),
+    };
+    let body = match resp.text().await {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+    let json: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let tag = json.get("tag_name").and_then(|v| v.as_str()).unwrap_or_default();
+    let page = json.get("html_url").and_then(|v| v.as_str()).unwrap_or_default();
+    if !page.is_empty() && parse_version(tag) > parse_version(env!("CARGO_PKG_VERSION")) {
+        Ok(Some(UpdateInfo {
+            version: tag.trim_start_matches('v').to_string(),
+            url: page.to_string(),
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Parse a `v1.2.3` / `1.2.3` tag into a comparable tuple (unknown parts -> 0).
+fn parse_version(s: &str) -> (u32, u32, u32) {
+    let s = s.trim().trim_start_matches('v');
+    let mut it = s.split(['.', '-', '+']);
+    let a = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let b = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let c = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    (a, b, c)
+}
+
+/// Download and install the latest signed release via the Tauri updater, then
+/// relaunch. Returns `Ok(false)` if already up to date. Errors (e.g. the updater
+/// isn't configured yet, or no signed artifact is published) let the UI fall
+/// back to opening the release page for a manual download.
+#[tauri::command]
+pub async fn install_update(app: AppHandle) -> Result<bool> {
+    #[cfg(desktop)]
+    {
+        use tauri_plugin_updater::UpdaterExt;
+        let updater = app
+            .updater()
+            .map_err(|e| VpnError::msg(e.to_string()))?;
+        if let Some(update) = updater
+            .check()
+            .await
+            .map_err(|e| VpnError::msg(e.to_string()))?
+        {
+            update
+                .download_and_install(|_, _| {}, || {})
+                .await
+                .map_err(|e| VpnError::msg(e.to_string()))?;
+            app.restart();
+        }
+        Ok(false)
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = app;
+        Ok(false)
+    }
+}
+
 #[tauri::command]
 pub async fn generate_ticket(engine: State<'_, Arc<VpnEngine>>) -> Result<String> {
     engine.generate_ticket().await
@@ -212,6 +391,7 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool> {
                 "/Create", "/TN", TASK_NAME, "/TR", &run, "/SC", "ONLOGON", "/RL", "HIGHEST",
                 "/F",
             ])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map_err(|e| VpnError::msg(format!("schtasks failed: {e}")))?;
         if !out.status.success() {
@@ -223,6 +403,7 @@ pub async fn set_autostart(app: AppHandle, enabled: bool) -> Result<bool> {
     } else {
         let _ = Command::new("schtasks")
             .args(["/Delete", "/TN", TASK_NAME, "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
             .output();
     }
     let mut s = load_settings(&app);
@@ -236,6 +417,7 @@ pub async fn get_autostart(_app: AppHandle) -> Result<bool> {
     use std::process::Command;
     let exists = Command::new("schtasks")
         .args(["/Query", "/TN", TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);

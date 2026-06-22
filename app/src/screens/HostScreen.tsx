@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { motion } from "framer-motion";
 import { QRCodeSVG } from "qrcode.react";
 import {
@@ -47,7 +47,6 @@ export function HostScreen({
   busy,
   onStartHost,
   onStopHost,
-  generateTicket,
 }: {
   status: StatusSnapshot;
   busy: boolean;
@@ -56,22 +55,12 @@ export function HostScreen({
     passphrase?: string | null;
   }) => void;
   onStopHost: () => void;
-  generateTicket: () => Promise<string>;
 }) {
   const hosting = status.state === "hosting" && status.role === "host";
   const [name, setName] = useState("");
   const [passphrase, setPassphrase] = useState("");
-  const [ticket, setTicket] = useState("");
 
-  useEffect(() => {
-    if (hosting) {
-      generateTicket()
-        .then(setTicket)
-        .catch(() => setTicket(""));
-    } else {
-      setTicket("");
-    }
-  }, [hosting, generateTicket]);
+  const pairingCode = status.endpointId ?? "";
 
   if (hosting) {
     return (
@@ -94,16 +83,21 @@ export function HostScreen({
         <div className="grid grid-cols-[260px_1fr] gap-5">
           <div className="glass-strong flex flex-col items-center justify-center rounded-3xl p-6">
             <div className="rounded-2xl bg-white p-3">
-              <QRCodeSVG value={ticket || "myvpn"} size={184} level="M" />
+              {pairingCode ? (
+                <QRCodeSVG value={pairingCode} size={184} level="M" />
+              ) : (
+                <div className="grid h-[184px] w-[184px] place-items-center text-xs text-black/50">
+                  Generating…
+                </div>
+              )}
             </div>
             <div className="mt-4 text-center text-xs text-[color:var(--color-muted)]">
-              Scan or paste this code on the other device
+              Paste this code on the other device's Connect screen
             </div>
           </div>
 
           <div className="flex flex-col gap-3">
-            <CopyRow label="Pairing code" value={ticket || "…"} />
-            <CopyRow label="Endpoint ID" value={status.endpointId ?? "—"} />
+            <CopyRow label="Pairing code" value={pairingCode || "…"} />
             <div className="glass rounded-2xl p-4">
               <div className="flex items-center gap-2 text-sm font-medium">
                 <ShieldCheck className="h-4 w-4 text-accent" />

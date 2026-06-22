@@ -1,7 +1,16 @@
+import { useState } from "react";
 import { motion } from "framer-motion";
 import type { ReactNode } from "react";
-import { Power, RefreshCcw, PanelTopClose, Info, LogOut, Server } from "lucide-react";
-import type { Settings } from "../lib/api";
+import {
+  Power,
+  RefreshCcw,
+  PanelTopClose,
+  Info,
+  LogOut,
+  Server,
+  DownloadCloud,
+} from "lucide-react";
+import type { Settings, UpdateInfo } from "../lib/api";
 import { Toggle } from "../components/ui/Toggle";
 import { Button } from "../components/ui/Button";
 import { TextField } from "../components/ui/TextField";
@@ -45,16 +54,35 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
 export function SettingsScreen({
   settings,
   autostartEnabled,
+  appVersion,
   onToggleAutostart,
   onChange,
+  onCheckUpdate,
   onQuit,
 }: {
   settings: Settings;
   autostartEnabled: boolean;
+  appVersion: string;
   onToggleAutostart: (v: boolean) => void;
   onChange: (patch: Partial<Settings>) => void;
+  onCheckUpdate: () => Promise<UpdateInfo | null>;
   onQuit: () => void;
 }) {
+  const [checking, setChecking] = useState(false);
+  const [checkMsg, setCheckMsg] = useState<string | null>(null);
+  const ver = appVersion || "\u2026";
+
+  const runCheck = async () => {
+    setChecking(true);
+    setCheckMsg(null);
+    const found = await onCheckUpdate();
+    setCheckMsg(
+      found
+        ? `Update available: v${found.version}`
+        : "You\u2019re on the latest version.",
+    );
+    setChecking(false);
+  };
   return (
     <motion.div
       initial={{ opacity: 0, y: 8 }}
@@ -133,11 +161,21 @@ export function SettingsScreen({
           <Row
             Icon={Info}
             title="MyVPN"
-            desc="Version 0.1.0 · Serverless peer-to-peer VPN"
+            desc={`Version ${ver} \u00b7 Serverless peer-to-peer VPN`}
             control={
               <span className="rounded-lg bg-[color:var(--color-accent-dim)] px-2.5 py-1 text-xs font-medium text-accent">
-                v0.1.0
+                v{ver}
               </span>
+            }
+          />
+          <Row
+            Icon={DownloadCloud}
+            title="Check for updates"
+            desc={checkMsg ?? "See if a newer version is available."}
+            control={
+              <Button variant="subtle" onClick={runCheck} disabled={checking}>
+                {checking ? "Checking\u2026" : "Check"}
+              </Button>
             }
           />
           <Row
