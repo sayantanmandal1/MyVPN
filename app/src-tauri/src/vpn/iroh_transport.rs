@@ -12,6 +12,7 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+// Brings `PublicKey::from_str` into scope; the warning about it being unused is a false positive.
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -574,4 +575,94 @@ fn dpapi_protect(_data: &[u8]) -> Option<Vec<u8>> {
 #[cfg(not(windows))]
 fn dpapi_unprotect(_data: &[u8]) -> Option<Vec<u8>> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hash_pass_is_deterministic_and_full_width() {
+        let a = hash_pass("correct horse battery staple");
+        let b = hash_pass("correct horse battery staple");
+        assert_eq!(a, b, "proof derivation must be deterministic");
+        assert_eq!(a.len(), 64, "expected a full 256-bit hex digest");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn hash_pass_separates_distinct_passphrases() {
+        assert_ne!(hash_pass("alpha"), hash_pass("bravo"));
+        assert_ne!(hash_pass("alpha"), hash_pass("alpha "));
+        assert_ne!(hash_pass(""), hash_pass(" "));
+    }
+
+    #[test]
+    fn derive_secret_is_deterministic() {
+        let proof = hash_pass("shared-secret");
+        let one = derive_secret("home-network", &proof);
+        let two = derive_secret("home-network", &proof);
+        assert_eq!(
+            one.public().to_string(),
+            two.public().to_string(),
+            "both peers must derive the same identity or they can never connect"
+        );
+    }
+
+    #[test]
+    fn derive_secret_normalises_name_case_and_padding() {
+        let proof = hash_pass("pw");
+        let canonical = derived_endpoint_id("Home Network", &proof);
+        for variant in ["home network", "HOME NETWORK", "  Home Network  ", "hOmE nEtWoRk"] {
+            assert_eq!(
+                canonical,
+                derived_endpoint_id(variant, &proof),
+                "name normalisation must make '{variant}' dial the same host"
+            );
+        }
+    }
+
+    #[test]
+    fn derive_secret_changes_with_either_input() {
+        let proof_a = hash_pass("pw-a");
+        let proof_b = hash_pass("pw-b");
+        let base = derived_endpoint_id("net", &proof_a);
+        assert_ne!(base, derived_endpoint_id("other", &proof_a), "name must affect identity");
+        assert_ne!(base, derived_endpoint_id("net", &proof_b), "passphrase must affect identity");
+    }
+
+    #[test]
+    fn derive_secret_is_not_ambiguous_across_the_name_boundary() {
+        // The zero byte between name and proof is what stops ("ab","c") and ("a","bc") from
+        // hashing the same bytes. Without it, two different networks could collide onto one
+        // identity, and a client could silently dial the wrong host.
+        let left = derive_secret("ab", "c").public().to_string();
+        let right = derive_secret("a", "bc").public().to_string();
+        assert_ne!(left, right, "name/proof boundary is not domain-separated");
+    }
+
+    #[test]
+    fn constant_time_eq_matches_normal_equality() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ABC"));
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_length_mismatch() {
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(!constant_time_eq(b"longer-prefix", b"longer"));
+    }
+
+    #[test]
+    fn constant_time_eq_accepts_a_real_proof_pair() {
+        let proof = hash_pass("a-passphrase");
+        let echoed = proof.clone();
+        assert!(constant_time_eq(proof.as_bytes(), echoed.as_bytes()));
+
+        let wrong = hash_pass("a-passphrasf");
+        assert!(!constant_time_eq(proof.as_bytes(), wrong.as_bytes()));
+    }
 }

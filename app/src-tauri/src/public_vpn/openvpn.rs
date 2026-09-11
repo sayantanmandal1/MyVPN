@@ -113,8 +113,15 @@ fn ovpn_args(config: &Path, mgmt_port: u16, log: &Path) -> Vec<String> {
         "AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC:BF-CBC".to_string(),
         "--data-ciphers-fallback".to_string(),
         "AES-128-CBC".to_string(),
+        // Fail fast on dead/slow free servers instead of hanging on OpenVPN's
+        // default 120s poll: bound each server poll and the TLS handshake, and
+        // only retry a couple of times before giving up with a clear error.
+        "--connect-timeout".to_string(),
+        "12".to_string(),
         "--connect-retry-max".to_string(),
-        "3".to_string(),
+        "2".to_string(),
+        "--hand-window".to_string(),
+        "15".to_string(),
         "--pull-filter".to_string(),
         "ignore".to_string(),
         "block-outside-dns".to_string(),

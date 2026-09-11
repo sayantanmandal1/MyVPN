@@ -530,7 +530,9 @@ impl VpnEngine {
             tun.shutdown();
         }
         if let Some(node) = node {
-            node.close().await;
+            // Cap endpoint shutdown so a lingering peer connection can't wedge
+            // teardown (which would make Stop hosting / Disconnect appear to hang).
+            let _ = tokio::time::timeout(Duration::from_secs(5), node.close()).await;
         }
     }
 

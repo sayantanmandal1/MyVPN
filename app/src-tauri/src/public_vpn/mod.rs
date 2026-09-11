@@ -286,6 +286,11 @@ fn spawn_monitor(
         // Stream real-time state notifications.
         let _ = write_half.write_all(b"state on\n").await;
 
+        // Hard cap on how long we'll sit in "Connecting" before giving up, so a
+        // dead/slow server can never leave the UI stuck forever.
+        let connect_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut settled = false;
+
         loop {
             tokio::select! {
                 line = lines.next_line() => {
@@ -308,6 +313,25 @@ fn spawn_monitor(
                         None => break,
                     }
                 }
+                _ = tokio::time::sleep_until(connect_deadline), if !settled => {
+                    if matches!(inner.lock().status.state, PublicState::Connecting) {
+                        // Still not connected: stop OpenVPN cleanly and surface a
+                        // clear, actionable error instead of an endless spinner.
+                        let _ = write_half.write_all(b"signal SIGTERM\n").await;
+                        set_state(
+                            &app,
+                            &inner,
+                            PublicState::Error,
+                            Some("The server didn’t respond in time — try another server."),
+                        );
+                        break;
+                    }
+                    settled = true;
+                }
+            }
+            // Once connected, disarm the deadline so it can't fire later.
+            if !settled && matches!(inner.lock().status.state, PublicState::Connected) {
+                settled = true;
             }
         }
 

@@ -271,7 +271,11 @@ const UPDATE_REPO: &str = "sayantanmandal1/MyVPN";
 /// single GET of public release metadata (no identifiers sent). Returns the new
 /// version and release page URL, or `None` when already current or unreachable.
 #[tauri::command]
-pub async fn check_update() -> Result<Option<UpdateInfo>> {
+pub async fn check_update(app: AppHandle) -> Result<Option<UpdateInfo>> {
+    // Compare against the running app's actual bundle version (the same value the
+    // UI shows and the updater uses), so we never claim an update is available
+    // when we're already on the latest build.
+    let current = app.package_info().version.to_string();
     let url = format!("https://api.github.com/repos/{UPDATE_REPO}/releases/latest");
     let client = reqwest::Client::builder()
         .user_agent(concat!("MyVPN/", env!("CARGO_PKG_VERSION")))
@@ -292,7 +296,7 @@ pub async fn check_update() -> Result<Option<UpdateInfo>> {
     };
     let tag = json.get("tag_name").and_then(|v| v.as_str()).unwrap_or_default();
     let page = json.get("html_url").and_then(|v| v.as_str()).unwrap_or_default();
-    if !page.is_empty() && parse_version(tag) > parse_version(env!("CARGO_PKG_VERSION")) {
+    if !page.is_empty() && parse_version(tag) > parse_version(&current) {
         Ok(Some(UpdateInfo {
             version: tag.trim_start_matches('v').to_string(),
             url: page.to_string(),

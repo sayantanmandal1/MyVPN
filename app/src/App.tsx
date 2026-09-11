@@ -268,14 +268,18 @@ function App() {
               onClick={async () => {
                 setUpdating(true);
                 try {
-                  // Installs the signed update and relaunches when configured.
-                  await api.installUpdate();
+                  // Downloads + installs the signed update and relaunches. If it
+                  // resolves without relaunching, the updater found nothing to
+                  // install (we're already current) — just clear the banner.
+                  const noUpdate = await api.installUpdate();
+                  if (noUpdate === false) setUpdate(null);
                 } catch {
-                  // fall through to a manual download
+                  // The signed updater isn't reachable (e.g. the release has no
+                  // latest.json yet) — fall back to the download page.
+                  openUrl(update.url).catch(() => {});
+                } finally {
+                  setUpdating(false);
                 }
-                // Reached only if the app didn't relaunch (updater not ready).
-                openUrl(update.url).catch(() => {});
-                setUpdating(false);
               }}
             >
               {updating ? "Updating\u2026" : "Update"}

@@ -40,21 +40,17 @@ jobs:
 
       - name: Publish to the vpn-data branch
         run: |
-          # Include a vercel.json that disables Vercel deployments for this
-          # branch. The main-branch vercel.json lives inside web/ and is never
-          # read by Vercel when it sees a push to this data-only branch, so we
-          # must include it here at the repo root of the branch itself.
-          cat > vercel.json <<'EOF'
-          {
-            "git": {
-              "deploymentEnabled": false
-            }
-          }
-          EOF
-
           git init -q .
           git checkout -q -b vpn-data
-          git add servers.csv vercel.json
+          # This branch holds only the server list — it has no web app, so tell
+          # Vercel (which reads git.deploymentEnabled from the branch it's about
+          # to build) not to deploy it. Written at both the repo root and the
+          # project Root Directory ("web") so it's found wherever Vercel looks.
+          disable='{ "git": { "deploymentEnabled": { "vpn-data": false } } }'
+          printf '%s\n' "$disable" > vercel.json
+          mkdir -p web
+          printf '%s\n' "$disable" > web/vercel.json
+          git add servers.csv vercel.json web/vercel.json
           git -c user.name="github-actions[bot]" \
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
               commit -q -m "Refresh public server list ($(date -u '+%Y-%m-%d %H:%M UTC'))"

@@ -250,3 +250,70 @@ pub fn remove_ipv6_killswitch(alias: &str) {
          }}"
     ));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `ensure_ip` is the last line of defence before a value is interpolated into a PowerShell
+    // command string. Everything it lets through is executed by a shell, so these cases are the
+    // security boundary of this module, not a formatting nicety.
+
+    #[test]
+    fn accepts_ipv4_and_ipv6_literals() {
+        for good in [
+            "10.0.0.1",
+            "192.168.1.254",
+            "0.0.0.0",
+            "255.255.255.255",
+            "::1",
+            "fe80::1",
+            "2001:db8::8a2e:370:7334",
+        ] {
+            assert!(ensure_ip(good).is_ok(), "rejected valid IP: {good}");
+        }
+    }
+
+    #[test]
+    fn tolerates_surrounding_whitespace() {
+        assert!(ensure_ip("  10.0.0.1  ").is_ok());
+        assert!(ensure_ip("\t192.168.0.1\n").is_ok());
+    }
+
+    #[test]
+    fn rejects_powershell_injection_payloads() {
+        // Each of these would run an extra command if it reached a PowerShell string.
+        for evil in [
+            "10.0.0.1; Remove-Item C:\\ -Recurse",
+            "10.0.0.1'; Stop-Computer; '",
+            "$(Get-Process)",
+            "`nStop-Service",
+            "10.0.0.1 | Out-File bad.txt",
+            "10.0.0.1 & calc.exe",
+            "'; whoami; '",
+            "10.0.0.1`",
+        ] {
+            assert!(
+                ensure_ip(evil).is_err(),
+                "SECURITY: injection payload accepted as an IP: {evil}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_ip_values() {
+        for bad in [
+            "",
+            "   ",
+            "localhost",
+            "example.com",
+            "10.0.0",
+            "10.0.0.256",
+            "999.999.999.999",
+            "10.0.0.1/24",
+            "10.0.0.1:8080",
+        ] {
+            assert!(ensure_ip(bad).is_err(), "accepted non-IP value: {bad}");
+        }
+    }
+}
